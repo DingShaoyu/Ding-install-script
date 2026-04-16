@@ -24,7 +24,17 @@ CLIENT_YAML="${INFO_DIR}/hy-client.yaml"
 CLIENT_JSON="${INFO_DIR}/hy-client.json"
 
 DEFAULT_SNI="www.bing.com"
-DEFAULT_MASQ_URL="https://www.bing.com"
+DEFAULT_MASQ_URL="https://en.snu.ac.kr"
+PORT=""
+SNI="${DEFAULT_SNI}"
+MASQ_URL="${DEFAULT_MASQ_URL}"
+FIRST_HOP_PORT=""
+END_HOP_PORT=""
+CERT_PATH="${CERT_FILE}"
+KEY_PATH="${KEY_FILE}"
+
+declare -a USERS=()
+declare -a PASSWDS=()
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1
@@ -33,9 +43,11 @@ need_cmd() {
 install_base_packages() {
     if need_cmd apt-get; then
         apt-get update
-        apt-get install -y curl wget openssl ufw
+        apt-get install -y curl wget openssl ufw socat cron iptables iptables-persistent netfilter-persistent
+        systemctl enable --now cron >/dev/null 2>&1 || true
     elif need_cmd yum; then
-        yum -y install curl wget openssl
+        yum -y install curl wget openssl socat cronie iptables-services
+        systemctl enable --now crond >/dev/null 2>&1 || true
     else
         red "不支持的系统，未找到 apt-get 或 yum"
         exit 1
@@ -43,16 +55,11 @@ install_base_packages() {
 }
 
 detect_arch() {
-    local arch
-    arch="$(uname -m)"
-    case "$arch" in
+    case "$(uname -m)" in
         x86_64|amd64) echo "amd64" ;;
         aarch64|arm64) echo "arm64" ;;
         armv7l|armv7) echo "armv7" ;;
-        *)
-            red "暂不支持的架构: $arch"
-            exit 1
-            ;;
+        *) red "暂不支持的架构: $(uname -m)"; exit 1 ;;
     esac
 }
 
@@ -64,90 +71,181 @@ install_hysteria() {
     green "下载 Hysteria2 二进制..."
     wget -O "${BIN_PATH}" "${url}"
     chmod +x "${BIN_PATH}"
-
-    green "当前版本："
     "${BIN_PATH}" version
 }
 
-prompt_config() {
-    read -rp "请输入监听端口 [默认 3032]: " PORT
-    PORT="${PORT:-3032}"
+port_in_use() {
+    local p="$1"
+    ss -tunlp | awk '{print $5}' | sed 's/.*://g' | grep -qw "$p"
+}
+
+prompt_port_and_hop() {
+    read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机）: " PORT
+    PORT="${PORT:-$(shuf -i 2000-65535 -n 1)}"
 
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
         red "端口不合法"
         exit 1
     fi
 
-    read -rp "请输入用户名 [默认 ding]: " USERNAME
-    USERNAME="${USERNAME:-ding}"
+    while port_in_use "$PORT"; do
+        yellow "端口 $PORT 已被占用，请重新输入"
+        read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机）: " PORT
+        PORT="${PORT:-$(shuf -i 2000-65535 -n 1)}"
+    done
 
-    if [[ -z "$USERNAME" ]]; then
-        red "用户名不能为空"
-        exit 1
-    fi
-
-    read -rsp "请输入密码: " PASSWORD
     echo
-    if [[ -z "$PASSWORD" ]]; then
-        red "密码不能为空"
-        exit 1
+    echo "1) 单端口（默认）"
+    echo "2) 端口跳跃"
+    read -rp "请选择端口模式 [1-2]: " mode
+    if [[ "${mode:-1}" == "2" ]]; then
+        read -rp "输入跳跃起始端口: " FIRST_HOP_PORT
+        read -rp "输入跳跃结束端口: " END_HOP_PORT
+        if ! [[ "$FIRST_HOP_PORT" =~ ^[0-9]+$ && "$END_HOP_PORT" =~ ^[0-9]+$ ]]; then
+            red "跳跃端口必须是数字"
+            exit 1
+        fi
+        if (( FIRST_HOP_PORT >= END_HOP_PORT )); then
+            red "起始端口必须小于结束端口"
+            exit 1
+        fi
     fi
+}
 
+prompt_users() {
+    echo
+    yellow "配置多用户（至少 1 个）"
+    while true; do
+        local u p
+        read -rp "用户名（回车结束添加）: " u
+        if [[ -z "$u" ]]; then
+            break
+        fi
+        read -rsp "密码: " p
+        echo
+        if [[ -z "$p" ]]; then
+            red "密码不能为空"
+            continue
+        fi
+        USERS+=("$u")
+        PASSWDS+=("$p")
+    done
+
+    if (( ${#USERS[@]} == 0 )); then
+        yellow "未输入用户，使用默认用户 ding"
+        USERS+=("ding")
+        PASSWDS+=("$(date +%s%N | md5sum | cut -c 1-10)")
+    fi
+}
+
+prompt_site() {
     read -rp "请输入 SNI/证书域名 [默认 ${DEFAULT_SNI}]: " SNI
     SNI="${SNI:-$DEFAULT_SNI}"
 
     read -rp "请输入伪装网站完整 URL [默认 ${DEFAULT_MASQ_URL}]: " MASQ_URL
     MASQ_URL="${MASQ_URL:-$DEFAULT_MASQ_URL}"
-
     if [[ ! "$MASQ_URL" =~ ^https?:// ]]; then
         red "伪装网站必须写完整 URL，例如 https://www.bing.com"
         exit 1
     fi
 }
 
-generate_cert() {
+install_acme_cert() {
+    local domain="$1"
+    local ip domain_ip
+
+    ip="$(curl -s4m8 ip.sb -k || curl -s6m8 ip.sb -k || true)"
+    domain_ip="$(curl -sm8 "https://ipget.net/?ip=${domain}" || true)"
+
+    if [[ -n "$ip" && -n "$domain_ip" && "$ip" != "$domain_ip" ]]; then
+        red "域名解析 IP (${domain_ip}) 与本机公网 IP (${ip}) 不一致"
+        exit 1
+    fi
+
+    if [[ ! -d /root/.acme.sh ]]; then
+        curl https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-12)@gmail.com"
+    fi
+
+    bash /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+    bash /root/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure
+
     mkdir -p "${CONFIG_DIR}"
+    bash /root/.acme.sh/acme.sh --install-cert -d "${domain}" \
+        --key-file "${KEY_FILE}" \
+        --fullchain-file "${CERT_FILE}" --ecc
 
-    green "生成自签证书..."
-    openssl ecparam -genkey -name prime256v1 -out "${KEY_FILE}"
-    openssl req -new -x509 -days 36500 \
-        -key "${KEY_FILE}" \
-        -out "${CERT_FILE}" \
-        -subj "/CN=${SNI}"
+    CERT_PATH="${CERT_FILE}"
+    KEY_PATH="${KEY_FILE}"
+}
 
-    chmod 600 "${KEY_FILE}"
-    chmod 644 "${CERT_FILE}"
+prompt_cert_mode() {
+    echo
+    green "Hysteria 2 证书申请方式："
+    echo "1) 自签证书（默认）"
+    echo "2) acme 自动申请"
+    echo "3) 自定义证书路径"
+
+    read -rp "请输入选项 [1-3]: " cert_mode
+    cert_mode="${cert_mode:-1}"
+
+    case "$cert_mode" in
+        2)
+            read -rp "请输入需要申请证书的域名: " domain
+            [[ -z "$domain" ]] && { red "域名不能为空"; exit 1; }
+            SNI="$domain"
+            install_acme_cert "$domain"
+            ;;
+        3)
+            read -rp "请输入证书 crt 文件路径: " CERT_PATH
+            read -rp "请输入私钥 key 文件路径: " KEY_PATH
+            read -rp "请输入证书域名（SNI）: " SNI
+            [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] || { red "证书或私钥不存在"; exit 1; }
+            [[ -n "$SNI" ]] || { red "SNI 不能为空"; exit 1; }
+            ;;
+        *)
+            mkdir -p "${CONFIG_DIR}"
+            openssl ecparam -genkey -name prime256v1 -out "${KEY_FILE}"
+            openssl req -new -x509 -days 36500 -key "${KEY_FILE}" -out "${CERT_FILE}" -subj "/CN=${SNI}"
+            chmod 600 "${KEY_FILE}"
+            chmod 644 "${CERT_FILE}"
+            CERT_PATH="${CERT_FILE}"
+            KEY_PATH="${KEY_FILE}"
+            ;;
+    esac
 }
 
 write_config() {
-    cat > "${CONFIG_FILE}" <<EOF
-listen: :${PORT}
-
-tls:
-  cert: ${CERT_FILE}
-  key: ${KEY_FILE}
-
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-
-auth:
-  type: userpass
-  userpass:
-    ${USERNAME}: ${PASSWORD}
-
-masquerade:
-  type: proxy
-  proxy:
-    url: ${MASQ_URL}
-    rewriteHost: true
-EOF
+    mkdir -p "${CONFIG_DIR}"
+    {
+        echo "listen: :${PORT}"
+        echo
+        echo "tls:"
+        echo "  cert: ${CERT_PATH}"
+        echo "  key: ${KEY_PATH}"
+        echo
+        echo "quic:"
+        echo "  initStreamReceiveWindow: 16777216"
+        echo "  maxStreamReceiveWindow: 16777216"
+        echo "  initConnReceiveWindow: 33554432"
+        echo "  maxConnReceiveWindow: 33554432"
+        echo
+        echo "auth:"
+        echo "  type: userpass"
+        echo "  userpass:"
+        for i in "${!USERS[@]}"; do
+            echo "    ${USERS[$i]}: ${PASSWDS[$i]}"
+        done
+        echo
+        echo "masquerade:"
+        echo "  type: proxy"
+        echo "  proxy:"
+        echo "    url: ${MASQ_URL}"
+        echo "    rewriteHost: true"
+    } > "${CONFIG_FILE}"
 }
 
 write_service() {
-    cat > "${SERVICE_FILE}" <<EOF
+    cat > "${SERVICE_FILE}" <<EOF_SERVICE
 [Unit]
 Description=Hysteria 2 Server
 After=network.target
@@ -160,27 +258,49 @@ RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
-EOF
+EOF_SERVICE
+}
+
+apply_port_hop_rules() {
+    if [[ -n "$FIRST_HOP_PORT" && -n "$END_HOP_PORT" ]]; then
+        need_cmd iptables && iptables -t nat -A PREROUTING -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" -j DNAT --to-destination ":${PORT}" || true
+        need_cmd ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" -j DNAT --to-destination ":${PORT}" || true
+        need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+    fi
 }
 
 get_public_ip() {
-    local ip=""
-    ip="$(curl -4 -s --max-time 8 https://api.ipify.org || true)"
+    local ip
+    ip="$(curl -s4m8 ip.sb -k || true)"
     if [[ -z "$ip" ]]; then
-        ip="$(curl -4 -s --max-time 8 https://ip.sb || true)"
+        ip="$(curl -s6m8 ip.sb -k || true)"
     fi
     echo "$ip"
 }
 
 write_client_info() {
-    local public_ip
-    public_ip="$(get_public_ip)"
+    local ip server_host server_port auth_line
+    ip="$(get_public_ip)"
+    server_port="$PORT"
+
+    if [[ -n "$FIRST_HOP_PORT" ]]; then
+        server_port="${PORT},${FIRST_HOP_PORT}-${END_HOP_PORT}"
+    fi
+
+    if [[ "$ip" == *":"* ]]; then
+        server_host="[${ip}]"
+    else
+        server_host="$ip"
+    fi
+
+    auth_line="${USERS[0]}:${PASSWDS[0]}"
+
     mkdir -p "${INFO_DIR}"
 
-    cat > "${CLIENT_YAML}" <<EOF
-server: ${public_ip}:${PORT}
+    cat > "${CLIENT_YAML}" <<EOF_YAML
+server: ${server_host}:${server_port}
 
-auth: ${USERNAME}:${PASSWORD}
+auth: ${auth_line}
 
 tls:
   sni: ${SNI}
@@ -196,12 +316,21 @@ fastOpen: true
 
 socks5:
   listen: 127.0.0.1:5678
-EOF
+EOF_YAML
 
-    cat > "${CLIENT_JSON}" <<EOF
+    if [[ -n "$FIRST_HOP_PORT" ]]; then
+        cat >> "${CLIENT_YAML}" <<'EOF_HOP'
+
+transport:
+  udp:
+    hopInterval: 30s
+EOF_HOP
+    fi
+
+    cat > "${CLIENT_JSON}" <<EOF_JSON
 {
-  "server": "${public_ip}:${PORT}",
-  "auth": "${USERNAME}:${PASSWORD}",
+  "server": "${server_host}:${server_port}",
+  "auth": "${auth_line}",
   "tls": {
     "sni": "${SNI}",
     "insecure": true
@@ -216,49 +345,340 @@ EOF
     "listen": "127.0.0.1:5678"
   }
 }
-EOF
+EOF_JSON
 
-    echo "hysteria2://${USERNAME}:${PASSWORD}@${public_ip}:${PORT}/?insecure=1&sni=${SNI}#${USERNAME}" > "${LINK_FILE}"
+    if [[ -n "$FIRST_HOP_PORT" ]]; then
+        cat > "${CLIENT_JSON}" <<EOF_JSON_HOP
+{
+  "server": "${server_host}:${server_port}",
+  "auth": "${auth_line}",
+  "tls": {
+    "sni": "${SNI}",
+    "insecure": true
+  },
+  "quic": {
+    "initStreamReceiveWindow": 16777216,
+    "maxStreamReceiveWindow": 16777216,
+    "initConnReceiveWindow": 33554432,
+    "maxConnReceiveWindow": 33554432
+  },
+  "socks5": {
+    "listen": "127.0.0.1:5678"
+  },
+  "transport": {
+    "udp": {
+      "hopInterval": "30s"
+    }
+  }
+}
+EOF_JSON_HOP
+    fi
+
+    : > "${LINK_FILE}"
+    for i in "${!USERS[@]}"; do
+        echo "hysteria2://${USERS[$i]}:${PASSWDS[$i]}@${server_host}:${server_port}/?insecure=1&sni=${SNI}#${USERS[$i]}" >> "${LINK_FILE}"
+    done
 }
 
 open_firewall() {
     if need_cmd ufw; then
-        ufw allow "${PORT}/udp" || true
+        ufw allow "${PORT}/udp" >/dev/null 2>&1 || true
     fi
 }
 
 start_service() {
     systemctl daemon-reload
-    systemctl enable hysteria-server.service
+    systemctl enable hysteria-server.service >/dev/null 2>&1
     systemctl restart hysteria-server.service
 }
 
 show_result() {
     green "安装完成"
+    yellow "配置文件: ${CONFIG_FILE}"
+    yellow "客户端 YAML: ${CLIENT_YAML}"
+    yellow "客户端 JSON: ${CLIENT_JSON}"
+    yellow "分享链接: ${LINK_FILE}"
     echo
-    yellow "服务状态："
-    systemctl --no-pager --full status hysteria-server.service | sed -n '1,12p'
-    echo
-    yellow "服务端配置文件：${CONFIG_FILE}"
-    yellow "客户端 YAML：${CLIENT_YAML}"
-    yellow "客户端 JSON：${CLIENT_JSON}"
-    yellow "分享链接：${LINK_FILE}"
-    echo
-    green "分享链接："
     cat "${LINK_FILE}"
 }
 
-main() {
+install_main() {
     install_base_packages
-    prompt_config
     install_hysteria
-    generate_cert
+    prompt_port_and_hop
+    prompt_users
+    prompt_site
+    prompt_cert_mode
     write_config
     write_service
+    apply_port_hop_rules
     open_firewall
     write_client_info
     start_service
     show_result
 }
 
-main
+start_hysteria() {
+    systemctl enable hysteria-server.service >/dev/null 2>&1 || true
+    systemctl start hysteria-server.service
+    green "hysteria-server 已启动"
+}
+
+stop_hysteria() {
+    systemctl stop hysteria-server.service
+    yellow "hysteria-server 已停止"
+}
+
+restart_hysteria() {
+    systemctl restart hysteria-server.service
+    green "hysteria-server 已重启"
+}
+
+uninstall_hysteria() {
+    systemctl stop hysteria-server.service >/dev/null 2>&1 || true
+    systemctl disable hysteria-server.service >/dev/null 2>&1 || true
+    rm -f "${SERVICE_FILE}"
+    rm -f "${BIN_PATH}"
+    rm -rf "${CONFIG_DIR}" "${INFO_DIR}"
+
+    need_cmd iptables && iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+    need_cmd ip6tables && ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
+    need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+
+    systemctl daemon-reload
+    green "已卸载 Hysteria 2"
+}
+
+add_user() {
+    [[ -f "${CONFIG_FILE}" ]] || { red "未找到服务端配置: ${CONFIG_FILE}"; exit 1; }
+
+    local new_user new_pass sni server
+    read -rp "输入要添加的用户名: " new_user
+    [[ -n "${new_user}" ]] || { red "用户名不能为空"; exit 1; }
+
+    read -rsp "输入密码: " new_pass
+    echo
+    [[ -n "${new_pass}" ]] || { red "密码不能为空"; exit 1; }
+
+    if grep -qE "^    ${new_user}:" "${CONFIG_FILE}"; then
+        red "用户 ${new_user} 已存在"
+        exit 1
+    fi
+
+    awk -v line="    ${new_user}: ${new_pass}" '
+        {print}
+        /^  userpass:$/ {print line}
+    ' "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+
+    sni="$(awk '/^[[:space:]]+sni:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+    server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+    if [[ -n "${server}" && -n "${sni}" ]]; then
+        echo "hysteria2://${new_user}:${new_pass}@${server}/?insecure=1&sni=${sni}#${new_user}" >> "${LINK_FILE}"
+    fi
+
+    restart_hysteria
+    green "用户 ${new_user} 已添加"
+}
+
+rebuild_links_from_config() {
+    [[ -f "${CONFIG_FILE}" && -f "${CLIENT_YAML}" ]] || return 0
+
+    local sni server
+    sni="$(awk '/^[[:space:]]+sni:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+    server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+    [[ -n "${sni}" && -n "${server}" ]] || return 0
+
+    : > "${LINK_FILE}"
+    awk '
+        /^  userpass:$/ {in=1; next}
+        in && /^$/ {in=0}
+        in && /^    [^:]+:/ {
+            sub(/^    /, "", $0)
+            print
+        }
+    ' "${CONFIG_FILE}" | while IFS= read -r kv; do
+        local u p
+        u="${kv%%:*}"
+        p="${kv#*: }"
+        echo "hysteria2://${u}:${p}@${server}/?insecure=1&sni=${sni}#${u}" >> "${LINK_FILE}"
+    done
+}
+
+delete_user() {
+    [[ -f "${CONFIG_FILE}" ]] || { red "未找到服务端配置: ${CONFIG_FILE}"; exit 1; }
+    local target_user
+    read -rp "输入要删除的用户名: " target_user
+    [[ -n "${target_user}" ]] || { red "用户名不能为空"; exit 1; }
+
+    if ! awk -v u="${target_user}" '
+        /^  userpass:$/ {in=1; next}
+        in && /^$/ {in=0}
+        in && $0 ~ "^    " u ":" {found=1}
+        END {exit(found?0:1)}
+    ' "${CONFIG_FILE}"; then
+        red "用户 ${target_user} 不存在"
+        exit 1
+    fi
+
+    cp -f "${CONFIG_FILE}" "${CONFIG_FILE}.bak"
+    awk -v u="${target_user}" '
+        /^  userpass:$/ {in=1; print; next}
+        in && /^$/ {in=0; print; next}
+        in && $0 ~ "^    " u ":" {next}
+        {print}
+    ' "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+
+    local user_count
+    user_count="$(awk '
+        /^  userpass:$/ {in=1; next}
+        in && /^$/ {in=0}
+        in && /^    [^:]+:/ {c++}
+        END {print c+0}
+    ' "${CONFIG_FILE}")"
+    if [[ "${user_count}" == "0" ]]; then
+        red "至少需要保留 1 个用户，已回滚"
+        mv "${CONFIG_FILE}.bak" "${CONFIG_FILE}"
+        exit 1
+    fi
+    rm -f "${CONFIG_FILE}.bak"
+
+    rebuild_links_from_config
+    restart_hysteria
+    green "用户 ${target_user} 已删除"
+}
+
+change_user_password() {
+    [[ -f "${CONFIG_FILE}" ]] || { red "未找到服务端配置: ${CONFIG_FILE}"; exit 1; }
+    local target_user new_pass
+    read -rp "输入要修改密码的用户名: " target_user
+    [[ -n "${target_user}" ]] || { red "用户名不能为空"; exit 1; }
+    read -rsp "输入新密码: " new_pass
+    echo
+    [[ -n "${new_pass}" ]] || { red "密码不能为空"; exit 1; }
+
+    if ! awk -v u="${target_user}" '
+        /^  userpass:$/ {in=1; next}
+        in && /^$/ {in=0}
+        in && $0 ~ "^    " u ":" {found=1}
+        END {exit(found?0:1)}
+    ' "${CONFIG_FILE}"; then
+        red "用户 ${target_user} 不存在"
+        exit 1
+    fi
+
+    awk -v u="${target_user}" -v p="${new_pass}" '
+        /^  userpass:$/ {in=1; print; next}
+        in && /^$/ {in=0; print; next}
+        in && $0 ~ "^    " u ":" {print "    " u ": " p; next}
+        {print}
+    ' "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp"
+    mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+
+    rebuild_links_from_config
+    restart_hysteria
+    green "用户 ${target_user} 密码已更新"
+}
+
+change_config() {
+    [[ -f "${CONFIG_FILE}" ]] || { red "未找到服务端配置: ${CONFIG_FILE}"; exit 1; }
+
+    echo "1) 修改监听端口"
+    echo "2) 修改伪装 URL"
+    echo "3) 修改 SNI（仅客户端文件）"
+    read -rp "请选择 [1-3]: " c
+
+    case "${c}" in
+        1)
+            local new_port old_server host_only new_server
+            read -rp "输入新端口 [1-65535]: " new_port
+            if ! [[ "${new_port}" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
+                red "端口不合法"
+                exit 1
+            fi
+            if port_in_use "${new_port}"; then
+                red "端口 ${new_port} 已被占用"
+                exit 1
+            fi
+            old_server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+            host_only="${old_server%:*}"
+            new_server="${host_only}:${new_port}"
+            sed -i -E "s/^listen: :.*/listen: :${new_port}/" "${CONFIG_FILE}"
+            [[ -n "${old_server}" ]] && sed -i -E "s#^server: .*#server: ${new_server}#" "${CLIENT_YAML}" || true
+            [[ -n "${old_server}" ]] && sed -i -E "s#\"server\": \".*\"#\"server\": \"${new_server}\"#" "${CLIENT_JSON}" || true
+            sed -i -E "s#@([^/]*):[0-9,-]+/#@\\1:${new_port}/#g" "${LINK_FILE}" || true
+            if need_cmd ufw; then
+                ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
+            fi
+            restart_hysteria
+            green "端口已修改为 ${new_port}"
+            ;;
+        2)
+            local new_url
+            read -rp "输入新的伪装 URL (https://...): " new_url
+            [[ "${new_url}" =~ ^https?:// ]] || { red "URL 格式错误"; exit 1; }
+            sed -i -E "s#^[[:space:]]+url: .*#    url: ${new_url}#" "${CONFIG_FILE}"
+            restart_hysteria
+            green "伪装 URL 已更新"
+            ;;
+        3)
+            local new_sni
+            read -rp "输入新的 SNI: " new_sni
+            [[ -n "${new_sni}" ]] || { red "SNI 不能为空"; exit 1; }
+            sed -i -E "s#^[[:space:]]+sni: .*#  sni: ${new_sni}#" "${CLIENT_YAML}" 2>/dev/null || true
+            sed -i -E "s#\"sni\": \".*\"#\"sni\": \"${new_sni}\"#" "${CLIENT_JSON}" 2>/dev/null || true
+            sed -i -E "s#(sni=)[^#]+#\\1${new_sni}#" "${LINK_FILE}" 2>/dev/null || true
+            green "客户端 SNI 已更新（服务端证书未自动重签）"
+            ;;
+        *)
+            red "无效选项"
+            exit 1
+            ;;
+    esac
+}
+
+show_info() {
+    yellow "服务状态："
+    systemctl --no-pager --full status hysteria-server.service | sed -n '1,12p' || true
+    echo
+    [[ -f "${CONFIG_FILE}" ]] && { yellow "服务端配置 ${CONFIG_FILE}"; cat "${CONFIG_FILE}"; echo; }
+    [[ -f "${CLIENT_YAML}" ]] && { yellow "客户端 YAML ${CLIENT_YAML}"; cat "${CLIENT_YAML}"; echo; }
+    [[ -f "${CLIENT_JSON}" ]] && { yellow "客户端 JSON ${CLIENT_JSON}"; cat "${CLIENT_JSON}"; echo; }
+    [[ -f "${LINK_FILE}" ]] && { yellow "分享链接 ${LINK_FILE}"; cat "${LINK_FILE}"; echo; }
+}
+
+menu() {
+    echo "=============================="
+    echo "Hysteria 2 管理菜单"
+    echo "1) 安装"
+    echo "2) 卸载"
+    echo "3) 启动服务"
+    echo "4) 停止服务"
+    echo "5) 重启服务"
+    echo "6) 查看配置/链接"
+    echo "7) 修改配置"
+    echo "8) 添加用户"
+    echo "9) 删除用户"
+    echo "10) 修改用户密码"
+    echo "0) 退出"
+    echo "=============================="
+    read -rp "请选择 [0-10]: " choice
+
+    case "${choice}" in
+        1) install_main ;;
+        2) uninstall_hysteria ;;
+        3) start_hysteria ;;
+        4) stop_hysteria ;;
+        5) restart_hysteria ;;
+        6) show_info ;;
+        7) change_config ;;
+        8) add_user ;;
+        9) delete_user ;;
+        10) change_user_password ;;
+        0) exit 0 ;;
+        *) red "无效选项"; exit 1 ;;
+    esac
+}
+
+menu
