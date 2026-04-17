@@ -49,10 +49,7 @@ validate_username() {
 validate_password() {
     local p="$1"
     [[ -n "$p" ]] || return 1
-    case "$p" in
-        *[[:space:]#:@/\?&]* ) return 1 ;;
-        * ) return 0 ;;
-    esac
+    [[ "$p" =~ ^[^[:space:]#:@/?&]+$ ]]
 }
 
 extract_server_host() {
