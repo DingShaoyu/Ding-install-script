@@ -32,12 +32,44 @@ FIRST_HOP_PORT=""
 END_HOP_PORT=""
 CERT_PATH="${CERT_FILE}"
 KEY_PATH="${KEY_FILE}"
+CLIENT_INSECURE="true"
 
 declare -a USERS=()
 declare -a PASSWDS=()
 
 need_cmd() {
     command -v "$1" >/dev/null 2>&1
+}
+
+validate_username() {
+    local u="$1"
+    [[ "$u" =~ ^[A-Za-z0-9._-]{1,32}$ ]]
+}
+
+validate_password() {
+    local p="$1"
+    [[ -n "$p" ]] || return 1
+    [[ "$p" =~ ^[^[:space:]#:@/\?&]+$ ]]
+}
+
+extract_server_host() {
+    local s="$1"
+    sed -E 's/^(\[[^]]+\]|[^:]+):.*/\1/' <<< "$s"
+}
+
+extract_server_suffix() {
+    local s="$1"
+    sed -E 's/^(\[[^]]+\]|[^:]+):([0-9]+)(,.*)?$/\3/' <<< "$s"
+}
+
+load_hop_range_from_server() {
+    local server="$1"
+    FIRST_HOP_PORT=""
+    END_HOP_PORT=""
+    if [[ "$server" =~ ,([0-9]+)-([0-9]+)$ ]]; then
+        FIRST_HOP_PORT="${BASH_REMATCH[1]}"
+        END_HOP_PORT="${BASH_REMATCH[2]}"
+    fi
 }
 
 install_base_packages() {
@@ -121,10 +153,14 @@ prompt_users() {
         if [[ -z "$u" ]]; then
             break
         fi
+        if ! validate_username "$u"; then
+            red "用户名仅支持 1-32 位：字母、数字、点、下划线、短横线"
+            continue
+        fi
         read -rsp "密码: " p
         echo
-        if [[ -z "$p" ]]; then
-            red "密码不能为空"
+        if ! validate_password "$p"; then
+            red "密码不能为空，且不能包含空白或 # : @ / ? &"
             continue
         fi
         USERS+=("$u")
@@ -167,7 +203,18 @@ install_acme_cert() {
     fi
 
     bash /root/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    bash /root/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure
+    if ! bash /root/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256; then
+        yellow "ACME 证书申请失败。"
+        yellow "是否使用 --insecure 重试（仅在证书校验异常时建议）？"
+        read -rp "请输入 [y/N]: " retry_insecure
+        retry_insecure="${retry_insecure:-N}"
+        if [[ "${retry_insecure,,}" =~ ^(y|yes)$ ]]; then
+            bash /root/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure
+        else
+            red "证书申请失败，已取消不安全重试。"
+            exit 1
+        fi
+    fi
 
     mkdir -p "${CONFIG_DIR}"
     bash /root/.acme.sh/acme.sh --install-cert -d "${domain}" \
@@ -194,6 +241,7 @@ prompt_cert_mode() {
             [[ -z "$domain" ]] && { red "域名不能为空"; exit 1; }
             SNI="$domain"
             install_acme_cert "$domain"
+            CLIENT_INSECURE="false"
             ;;
         3)
             read -rp "请输入证书 crt 文件路径: " CERT_PATH
@@ -201,6 +249,7 @@ prompt_cert_mode() {
             read -rp "请输入证书域名（SNI）: " SNI
             [[ -f "$CERT_PATH" && -f "$KEY_PATH" ]] || { red "证书或私钥不存在"; exit 1; }
             [[ -n "$SNI" ]] || { red "SNI 不能为空"; exit 1; }
+            CLIENT_INSECURE="false"
             ;;
         *)
             mkdir -p "${CONFIG_DIR}"
@@ -210,6 +259,7 @@ prompt_cert_mode() {
             chmod 644 "${CERT_FILE}"
             CERT_PATH="${CERT_FILE}"
             KEY_PATH="${KEY_FILE}"
+            CLIENT_INSECURE="true"
             ;;
     esac
 }
@@ -262,11 +312,48 @@ EOF_SERVICE
 }
 
 apply_port_hop_rules() {
-    if [[ -n "$FIRST_HOP_PORT" && -n "$END_HOP_PORT" ]]; then
-        need_cmd iptables && iptables -t nat -A PREROUTING -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" -j DNAT --to-destination ":${PORT}" || true
-        need_cmd ip6tables && ip6tables -t nat -A PREROUTING -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" -j DNAT --to-destination ":${PORT}" || true
-        need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+    local chain="HYSTERIA2_HOP"
+
+    if need_cmd iptables; then
+        iptables -t nat -N "${chain}" >/dev/null 2>&1 || true
+        iptables -t nat -C PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || \
+            iptables -t nat -A PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || true
+        iptables -t nat -F "${chain}" >/dev/null 2>&1 || true
+        if [[ -n "$FIRST_HOP_PORT" && -n "$END_HOP_PORT" ]]; then
+            iptables -t nat -A "${chain}" -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" \
+                -j DNAT --to-destination ":${PORT}" >/dev/null 2>&1 || true
+        fi
     fi
+
+    if need_cmd ip6tables; then
+        ip6tables -t nat -N "${chain}" >/dev/null 2>&1 || true
+        ip6tables -t nat -C PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || \
+            ip6tables -t nat -A PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || true
+        ip6tables -t nat -F "${chain}" >/dev/null 2>&1 || true
+        if [[ -n "$FIRST_HOP_PORT" && -n "$END_HOP_PORT" ]]; then
+            ip6tables -t nat -A "${chain}" -p udp --dport "${FIRST_HOP_PORT}:${END_HOP_PORT}" \
+                -j DNAT --to-destination ":${PORT}" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+}
+
+cleanup_port_hop_rules() {
+    local chain="HYSTERIA2_HOP"
+
+    if need_cmd iptables; then
+        iptables -t nat -F "${chain}" >/dev/null 2>&1 || true
+        iptables -t nat -D PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || true
+        iptables -t nat -X "${chain}" >/dev/null 2>&1 || true
+    fi
+    if need_cmd ip6tables; then
+        ip6tables -t nat -F "${chain}" >/dev/null 2>&1 || true
+        ip6tables -t nat -D PREROUTING -p udp -j "${chain}" >/dev/null 2>&1 || true
+        ip6tables -t nat -X "${chain}" >/dev/null 2>&1 || true
+    fi
+
+    need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
 }
 
 get_public_ip() {
@@ -276,6 +363,19 @@ get_public_ip() {
         ip="$(curl -s6m8 ip.sb -k || true)"
     fi
     echo "$ip"
+}
+
+build_share_link() {
+    local user="$1"
+    local pass="$2"
+    local server_host="$3"
+    local server_port="$4"
+
+    if [[ "${CLIENT_INSECURE}" == "true" ]]; then
+        echo "hysteria2://${user}:${pass}@${server_host}:${server_port}/?insecure=1&sni=${SNI}#${user}"
+    else
+        echo "hysteria2://${user}:${pass}@${server_host}:${server_port}/?sni=${SNI}#${user}"
+    fi
 }
 
 write_client_info() {
@@ -304,7 +404,7 @@ auth: ${auth_line}
 
 tls:
   sni: ${SNI}
-  insecure: true
+  insecure: ${CLIENT_INSECURE}
 
 quic:
   initStreamReceiveWindow: 16777216
@@ -333,7 +433,7 @@ EOF_HOP
   "auth": "${auth_line}",
   "tls": {
     "sni": "${SNI}",
-    "insecure": true
+    "insecure": ${CLIENT_INSECURE}
   },
   "quic": {
     "initStreamReceiveWindow": 16777216,
@@ -354,7 +454,7 @@ EOF_JSON
   "auth": "${auth_line}",
   "tls": {
     "sni": "${SNI}",
-    "insecure": true
+    "insecure": ${CLIENT_INSECURE}
   },
   "quic": {
     "initStreamReceiveWindow": 16777216,
@@ -376,7 +476,7 @@ EOF_JSON_HOP
 
     : > "${LINK_FILE}"
     for i in "${!USERS[@]}"; do
-        echo "hysteria2://${USERS[$i]}:${PASSWDS[$i]}@${server_host}:${server_port}/?insecure=1&sni=${SNI}#${USERS[$i]}" >> "${LINK_FILE}"
+        build_share_link "${USERS[$i]}" "${PASSWDS[$i]}" "${server_host}" "${server_port}" >> "${LINK_FILE}"
     done
 }
 
@@ -441,9 +541,7 @@ uninstall_hysteria() {
     rm -f "${BIN_PATH}"
     rm -rf "${CONFIG_DIR}" "${INFO_DIR}"
 
-    need_cmd iptables && iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
-    need_cmd ip6tables && ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
-    need_cmd netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
+    cleanup_port_hop_rules
 
     systemctl daemon-reload
     green "已卸载 Hysteria 2"
@@ -455,10 +553,11 @@ add_user() {
     local new_user new_pass sni server
     read -rp "输入要添加的用户名: " new_user
     [[ -n "${new_user}" ]] || { red "用户名不能为空"; exit 1; }
+    validate_username "${new_user}" || { red "用户名仅支持 1-32 位：字母、数字、点、下划线、短横线"; exit 1; }
 
     read -rsp "输入密码: " new_pass
     echo
-    [[ -n "${new_pass}" ]] || { red "密码不能为空"; exit 1; }
+    validate_password "${new_pass}" || { red "密码不能为空，且不能包含空白或 # : @ / ? &"; exit 1; }
 
     if grep -qE "^    ${new_user}:" "${CONFIG_FILE}"; then
         red "用户 ${new_user} 已存在"
@@ -474,7 +573,11 @@ add_user() {
     sni="$(awk '/^[[:space:]]+sni:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
     server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
     if [[ -n "${server}" && -n "${sni}" ]]; then
-        echo "hysteria2://${new_user}:${new_pass}@${server}/?insecure=1&sni=${sni}#${new_user}" >> "${LINK_FILE}"
+        if grep -qE '^[[:space:]]+insecure:[[:space:]]+true$' "${CLIENT_YAML}" 2>/dev/null; then
+            echo "hysteria2://${new_user}:${new_pass}@${server}/?insecure=1&sni=${sni}#${new_user}" >> "${LINK_FILE}"
+        else
+            echo "hysteria2://${new_user}:${new_pass}@${server}/?sni=${sni}#${new_user}" >> "${LINK_FILE}"
+        fi
     fi
 
     restart_hysteria
@@ -484,9 +587,10 @@ add_user() {
 rebuild_links_from_config() {
     [[ -f "${CONFIG_FILE}" && -f "${CLIENT_YAML}" ]] || return 0
 
-    local sni server
+    local sni server insecure_flag
     sni="$(awk '/^[[:space:]]+sni:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
     server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
+    insecure_flag="$(awk '/^[[:space:]]+insecure:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
     [[ -n "${sni}" && -n "${server}" ]] || return 0
 
     : > "${LINK_FILE}"
@@ -501,7 +605,11 @@ rebuild_links_from_config() {
         local u p
         u="${kv%%:*}"
         p="${kv#*: }"
-        echo "hysteria2://${u}:${p}@${server}/?insecure=1&sni=${sni}#${u}" >> "${LINK_FILE}"
+        if [[ "${insecure_flag}" == "true" ]]; then
+            echo "hysteria2://${u}:${p}@${server}/?insecure=1&sni=${sni}#${u}" >> "${LINK_FILE}"
+        else
+            echo "hysteria2://${u}:${p}@${server}/?sni=${sni}#${u}" >> "${LINK_FILE}"
+        fi
     done
 }
 
@@ -556,7 +664,7 @@ change_user_password() {
     [[ -n "${target_user}" ]] || { red "用户名不能为空"; exit 1; }
     read -rsp "输入新密码: " new_pass
     echo
-    [[ -n "${new_pass}" ]] || { red "密码不能为空"; exit 1; }
+    validate_password "${new_pass}" || { red "密码不能为空，且不能包含空白或 # : @ / ? &"; exit 1; }
 
     if ! awk -v u="${target_user}" '
         /^  userpass:$/ {in=1; next}
@@ -591,7 +699,7 @@ change_config() {
 
     case "${c}" in
         1)
-            local new_port old_server host_only new_server
+            local new_port old_server host_only server_suffix new_server
             read -rp "输入新端口 [1-65535]: " new_port
             if ! [[ "${new_port}" =~ ^[0-9]+$ ]] || (( new_port < 1 || new_port > 65535 )); then
                 red "端口不合法"
@@ -602,12 +710,16 @@ change_config() {
                 exit 1
             fi
             old_server="$(awk '/^server:/{print $2; exit}' "${CLIENT_YAML}" 2>/dev/null || true)"
-            host_only="${old_server%:*}"
-            new_server="${host_only}:${new_port}"
+            host_only="$(extract_server_host "${old_server}")"
+            server_suffix="$(extract_server_suffix "${old_server}")"
+            new_server="${host_only}:${new_port}${server_suffix}"
+            load_hop_range_from_server "${old_server}"
+            PORT="${new_port}"
             sed -i -E "s/^listen: :.*/listen: :${new_port}/" "${CONFIG_FILE}"
             [[ -n "${old_server}" ]] && sed -i -E "s#^server: .*#server: ${new_server}#" "${CLIENT_YAML}" || true
             [[ -n "${old_server}" ]] && sed -i -E "s#\"server\": \".*\"#\"server\": \"${new_server}\"#" "${CLIENT_JSON}" || true
-            sed -i -E "s#@([^/]*):[0-9,-]+/#@\\1:${new_port}/#g" "${LINK_FILE}" || true
+            rebuild_links_from_config
+            apply_port_hop_rules
             if need_cmd ufw; then
                 ufw allow "${new_port}/udp" >/dev/null 2>&1 || true
             fi
