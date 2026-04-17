@@ -189,7 +189,7 @@ install_acme_cert() {
     local ip domain_ip
 
     ip="$(curl -s4m8 ip.sb -k || curl -s6m8 ip.sb -k || true)"
-    domain_ip="$(curl -sm8 "https://ipget.net/?ip=${domain}" || true)"
+    domain_ip="$(getent hosts "$domain" | awk '{print $1}' | head -n1)"
 
     if [[ -n "$ip" && -n "$domain_ip" && "$ip" != "$domain_ip" ]]; then
         red "域名解析 IP (${domain_ip}) 与本机公网 IP (${ip}) 不一致"
